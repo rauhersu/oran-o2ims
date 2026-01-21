@@ -26,6 +26,12 @@
 11. [Provisioning Flow Deep Dive: Who Does What?](#11-provisioning-flow-deep-dive-who-does-what)
 12. [Is Metal3 the Only Plugin?](#12-is-metal3-the-only-plugin)
 13. [Corrections and Refinements](#13-corrections-and-refinements-based-on-official-documentation-review) *(Added after official docs review)*
+14. [Server Pattern Deep Dive](#14-server-pattern-deep-dive) *(Added January 21, 2026)*
+    - [Single Dockerfile Architecture](#141-single-dockerfile-architecture)
+    - [Single Binary with Cobra Subcommands](#142-single-binary-with-cobra-subcommands)
+    - [Deployment Creation by Inventory Controller](#143-deployment-creation-by-inventory-controller)
+    - [OpenAPI Code Generation](#144-openapi-code-generation)
+    - [Runtime OpenAPI Spec Usage](#145-runtime-openapi-spec-usage)
 
 ---
 
@@ -264,7 +270,8 @@ Inventory CR creates:
 ├── PersistentVolumeClaim: postgres-server-pvc
 ├── Service: per-server (ClusterIP)
 ├── Deployment: 8 deployments (see pod layout)
-└── Ingress: oran-o2ims (routes to all servers)
+└── Ingress: 
+(routes to all servers)
 ```
 
 ---
@@ -2786,9 +2793,542 @@ receivers:
 
 ---
 
+## 14. Server Pattern Deep Dive
+
+### Question
+
+> I have a new question, examine the servers (resource-server, cluster-server, ...). Explain the low level details for its creation: do they have dedicated dockerfiles? How are they started?
+
+### Answer
+
+### 14.1 Single Dockerfile Architecture
+
+**All servers share ONE Dockerfile** located at the project root. There are no dedicated Dockerfiles per server.
+
+```dockerfile
+# Dockerfile (project root)
+# Build the manager binary
+FROM registry.hub.docker.com/library/golang:1.24 AS builder
+# ...build steps...
+
+# Build single binary
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -gcflags "${GOBUILD_GCFLAGS}" -mod=vendor -a
+
+# Use distroless as minimal base image
+FROM gcr.io/distroless/static:nonroot AS production
+WORKDIR /
+COPY --from=builder /workspace/oran-o2ims /usr/bin
+USER 65532:65532
+
+ENTRYPOINT ["/usr/bin/oran-o2ims"]
+```
+
+**Key insight**: The build produces a **single binary** called `oran-o2ims` that contains ALL server functionality. There are no separate images per server.
+
+### 14.2 Single Binary with Cobra Subcommands
+
+The main entry point at `main.go` registers all server commands using Cobra CLI:
+
+```go
+// main.go
+func main() {
+    toolBuilder := internal.NewTool().
+        AddArgs(os.Args...).
+        AddCommand(cmd.Start).                              // start controller-manager
+        AddCommand(cmd.Version).
+        AddCommand(hwpluginscmd.Start).                     // hardwareplugin-manager start
+        AddCommand(metal3plugincmd.Start).                  // metal3-hardwareplugin-manager start
+        AddCommand(alarmscmd.GetAlarmRootCmd).              // alarms-server serve
+        AddCommand(clustercmd.GetClusterRootCmd).           // cluster-server serve
+        AddCommand(inventorycmd.GetResourcesRootCmd).       // resource-server serve
+        AddCommand(artifactscmd.GetArtifactsRootCmd).       // artifacts-server serve
+        AddCommand(provisioningcmd.GetProvisioningRootCmd)  // provisioning-server serve
+}
+```
+
+**Command Structure:**
+
+| Command | Subcommand | Description |
+|---------|------------|-------------|
+| `resource-server` | `serve` | Start resource/inventory API server |
+| `resource-server` | `migrate` | Run DB migrations |
+| `cluster-server` | `serve` | Start cluster/deployment managers API |
+| `alarms-server` | `serve` | Start monitoring/alarms API |
+| `artifacts-server` | `serve` | Start artifacts download server |
+| `provisioning-server` | `serve` | Start provisioning API |
+| `hardwareplugin-manager` | `start` | Start HW plugin manager controller |
+| `metal3-hardwareplugin-manager` | `start` | Start Metal3 plugin (hybrid) |
+| `start` | `controller-manager` | Start main operator |
+
+### 14.3 Deployment Creation by Inventory Controller
+
+The **Inventory reconciler** (`internal/controllers/inventory_controller.go`) creates all server deployments **programmatically** - not from YAML files.
+
+The `deployServer()` function builds Kubernetes Deployments dynamically:
+
+```go
+func (t *reconcilerTask) deployServer(ctx context.Context, serverName string) error {
+    // Select the container image
+    image := t.image
+    if t.object.Spec.Image != nil {
+        image = *t.object.Spec.Image
+    }
+
+    // Build the deployment's spec
+    deploymentSpec := appsv1.DeploymentSpec{
+        Replicas: k8sptr.To(int32(1)),
+        Template: corev1.PodTemplateSpec{
+            Spec: corev1.PodSpec{
+                ServiceAccountName: serverName,
+                Containers: []corev1.Container{
+                    {
+                        Name:    constants.ServerContainerName,
+                        Image:   image,
+                        Command: []string{constants.ManagerExec},  // /usr/bin/oran-o2ims
+                        Args:    deploymentContainerArgs,           // ["resource-server", "serve", ...]
+                    },
+                },
+            },
+        },
+    }
+
+    // For servers with databases, add init container for migrations
+    if ctlrutils.HasDatabase(serverName) {
+        deploymentSpec.Template.Spec.InitContainers = []corev1.Container{
+            {
+                Name:    constants.MigrationContainerName,  // "migration"
+                Image:   image,
+                Command: []string{constants.ManagerExec},
+                Args:    []string{serverName, "migrate"},   // e.g., ["resource-server", "migrate"]
+            },
+        }
+    }
+}
+```
+
+**Server Arguments** are defined in `internal/controllers/utils/constants.go`:
+
+```go
+var ResourceServerArgs = []string{
+    constants.ResourceServerCmd,    // "resource-server"
+    constants.ServeSubcommand,      // "serve"
+    fmt.Sprintf("--api-listener-address=0.0.0.0:%d", constants.DefaultContainerPort),
+    fmt.Sprintf("--tls-server-cert=%s/%s", constants.TLSServerMountPath, constants.TLSCertField),
+    fmt.Sprintf("--tls-server-key=%s/%s", constants.TLSServerMountPath, constants.TLSKeyField),
+}
+```
+
+### Server Startup Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    BUILD TIME                                                │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│   Dockerfile ──────►  Single Binary: /usr/bin/oran-o2ims                                   │
+│                              │                                                              │
+│                              ├── "start controller-manager"  ──► operator                   │
+│                              ├── "resource-server serve"     ──► resource API               │
+│                              ├── "cluster-server serve"      ──► cluster API                │
+│                              ├── "alarms-server serve"       ──► alarms API                 │
+│                              ├── "artifacts-server serve"    ──► artifacts API              │
+│                              ├── "provisioning-server serve" ──► provisioning API           │
+│                              └── "metal3-hardwareplugin-manager start" ──► metal3           │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    RUNTIME                                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│   Inventory CR created                                                                      │
+│         │                                                                                   │
+│         ▼                                                                                   │
+│   controller-manager (Inventory Reconciler)                                                 │
+│         │                                                                                   │
+│         ├──► deployServer("resource-server") ──► Creates Deployment:                        │
+│         │        Container: image = quay.io/.../oran-o2ims:latest                          │
+│         │        Command:   ["/usr/bin/oran-o2ims"]                                         │
+│         │        Args:      ["resource-server", "serve", "--api-listener-address=...", ...]│
+│         │        InitContainer: ["resource-server", "migrate"]  (if HasDatabase)           │
+│         │                                                                                   │
+│         ├──► deployServer("cluster-server")  ──► Similar pattern                           │
+│         ├──► deployServer("alarms-server")   ──► Similar pattern                           │
+│         ├──► deployServer("artifacts-server")──► Similar pattern (no InitContainer)        │
+│         └──► deployServer("provisioning-server") ──► Similar (no InitContainer)            │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Takeaways
+
+| Aspect | Details |
+|--------|---------|
+| **Dockerfiles** | **1 shared Dockerfile** - all servers use the same image |
+| **Binary** | **1 binary** (`oran-o2ims`) with **Cobra subcommands** |
+| **Deployment creation** | **Programmatic** via `deployServer()` in Inventory controller |
+| **Server differentiation** | **Command-line arguments** determine which server code runs |
+| **DB migrations** | **Init container** runs `[server-name] migrate` before main container |
+| **TLS** | Certificates mounted from OpenShift service-serving-cert secrets |
+| **Code location** | Each server in `internal/service/<name>/` with `cmd/`, `api/`, `serve.go` |
+
+---
+
+### Question
+
+> Do every server load its own openapi file for api validations? Or must we manually (make generate) the golang code for those servers to use?
+
+### Answer
+
+### 14.4 OpenAPI Code Generation
+
+**YES to both** - Each server has its own OpenAPI spec AND requires code generation.
+
+Each server:
+1. **Has its own `openapi.yaml` file** - specific to that API
+2. **Requires code generation** (`go generate` or `make go-generate`) to create the Go code
+3. **Embeds the OpenAPI spec at build time** - compressed and base64-encoded into the generated `.go` file
+4. **Loads the embedded spec at runtime** via `GetSwagger()` for request validation
+
+#### OpenAPI Spec Organization
+
+```
+internal/service/
+├── common/api/
+│   ├── openapi.yaml              ← Shared types (ProblemDetails, etc.)
+│   ├── tools/
+│   │   ├── generate.go           ← //go:generate directive
+│   │   └── oapi-codegen.yaml     ← Code generation config
+│   └── generated/
+│       └── common.generated.go   ← Generated types + embedded spec
+│
+├── resources/api/                (Inventory API - /o2ims-infrastructureInventory)
+│   ├── openapi.yaml              ← ResourcePool, ResourceType, Resource, etc.
+│   ├── openapi-overlay.yaml      ← Modifications/patches to spec
+│   ├── tools/
+│   │   ├── generate.go
+│   │   └── oapi-codegen.yaml
+│   └── generated/
+│       └── inventory.generated.go  ← ~3650 lines of generated code
+│
+├── cluster/api/                   (Cluster API)
+├── alarms/api/                    (Monitoring API)
+├── artifacts/api/                 (Artifacts API)
+└── provisioning/api/              (Provisioning API)
+```
+
+#### Code Generation Configuration
+
+Each server has its own `oapi-codegen.yaml` config:
+
+```yaml
+# internal/service/resources/api/tools/oapi-codegen.yaml
+package: generated
+output: ../generated/inventory.generated.go
+
+generate:
+  std-http-server: true      # Generate Go 1.22 stdlib router
+  client: false              # No HTTP client (server-only)
+  models: true               # Generate struct types
+  embedded-spec: true        # Embed OpenAPI spec in binary ← KEY!
+  strict-server: true        # Type-safe request/response handlers
+
+import-mapping:
+  ../../common/api/openapi.yaml: "github.com/openshift-kni/oran-o2ims/internal/service/common/api/generated"
+```
+
+#### The `generate.go` Trigger File
+
+```go
+// internal/service/resources/api/tools/generate.go
+package tools
+
+//go:generate go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen -config oapi-codegen.yaml ../openapi.yaml
+```
+
+#### How to Regenerate Code
+
+```bash
+# Using go generate (processes all //go:generate directives)
+go generate ./...
+
+# Or using the Makefile target
+make go-generate
+
+# Regenerate a specific service
+cd internal/service/resources/api/tools && go generate
+```
+
+#### Summary Table
+
+| Server | OpenAPI Spec Location | Generated File | Size |
+|--------|----------------------|----------------|------|
+| **resource-server** | `internal/service/resources/api/openapi.yaml` | `inventory.generated.go` | ~3650 lines |
+| **cluster-server** | `internal/service/cluster/api/openapi.yaml` | `cluster.generated.go` | ~3250 lines |
+| **alarms-server** | `internal/service/alarms/api/openapi.yaml` | `alarms.generated.go` | ~2500 lines |
+| **artifacts-server** | `internal/service/artifacts/api/openapi.yaml` | `artifacts.generated.go` | ~1050 lines |
+| **provisioning-server** | `internal/service/provisioning/api/openapi.yaml` | `provisioning.generated.go` | ~1350 lines |
+| **common (shared)** | `internal/service/common/api/openapi.yaml` | `common.generated.go` | ~290 lines |
+
+---
+
+### Question
+
+> Then the openapi file is not directly used by any server (it is not read), only the generated go code is used. Am I correct?
+
+### Answer
+
+**Yes, 100% correct!**
+
+The `openapi.yaml` files are **never read at runtime**. They are only used at **code generation time**.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    BUILD TIME                                                │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│   openapi.yaml ────► oapi-codegen ────► *.generated.go                                     │
+│        │                                      │                                             │
+│   (YAML file on disk)                    (Go source code with                               │
+│                                           embedded spec as                                  │
+│                                           base64+gzip string)                              │
+│                                                                                             │
+│   This file is NOT                       This IS compiled                                   │
+│   included in the                        into the binary                                    │
+│   final binary                                                                              │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    RUNTIME                                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│   /usr/bin/oran-o2ims                                                                       │
+│         │                                                                                   │
+│         ├── Contains compiled *.generated.go code                                           │
+│         │                                                                                   │
+│         └── GetSwagger() decodes embedded spec from Go string constant                      │
+│                    │                                                                        │
+│                    ▼                                                                        │
+│              openapi3.T (in-memory object)                                                  │
+│                    │                                                                        │
+│                    └── Used by middleware.OpenAPIValidation()                               │
+│                                                                                             │
+│   NO file I/O needed!                                                                       │
+│   NO openapi.yaml file required in container!                                               │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Implications:**
+
+| Aspect | Implication |
+|--------|-------------|
+| **Container image** | Does NOT need `openapi.yaml` files - they're embedded in the binary |
+| **Runtime dependencies** | Zero file I/O for OpenAPI specs |
+| **Spec changes** | Require regenerating code (`go generate`) and rebuilding the binary |
+| **Validation** | Happens against the spec that was embedded at build time |
+
+---
+
+### Question
+
+> Does the generated.go show the go structures or just an encoded version of the openapi?
+
+### Answer
+
+**Both!** The generated file contains:
+
+1. ✅ **Readable Go structs** for all OpenAPI schemas (models)
+2. ✅ **HTTP handler interfaces** (type-safe server interface)
+3. ✅ **Router/handler code** (request parsing, response serialization)
+4. ✅ **AND** the encoded OpenAPI spec (for runtime validation)
+
+#### What's Inside `inventory.generated.go` (~3650 lines)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                          inventory.generated.go STRUCTURE                                    │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│  Lines 1-30:      Package declaration, imports                                              │
+│                                                                                             │
+│  Lines 31-850:    GO STRUCT TYPES (readable!)                                              │
+│                   - DeploymentManager                                                       │
+│                   - OCloudInfo                                                              │
+│                   - Resource                                                                │
+│                   - ResourcePool                                                            │
+│                   - ResourceType                                                            │
+│                   - Subscription                                                            │
+│                                                                                             │
+│  Lines 850-1200:  Request/Response parameter types                                          │
+│                   - GetResourcePoolParams                                                   │
+│                   - GetResourcesParams                                                      │
+│                                                                                             │
+│  Lines 1200-1400: StrictServerInterface (handler interface)                                │
+│                   - Your server.go implements this                                          │
+│                                                                                             │
+│  Lines 1400-2800: HTTP handler wrapper code                                                 │
+│                   - Request parsing                                                         │
+│                   - Path parameter extraction                                               │
+│                   - Query parameter binding                                                 │
+│                   - Response serialization                                                  │
+│                                                                                             │
+│  Lines 2800-3450: Typed response implementations                                            │
+│                   - GetResourcePool200JSONResponse                                          │
+│                   - GetResourcePool404ApplicationProblemPlusJSONResponse                    │
+│                                                                                             │
+│  Lines 3456-3650: ENCODED OPENAPI SPEC (base64+gzip)                                       │
+│                   - var swaggerSpec = []string{...}                                         │
+│                   - GetSwagger() function                                                   │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Examples of Readable Go Structs
+
+```go
+// DeploymentManager Information about a deployment manager.
+type DeploymentManager struct {
+    Capabilities        map[string]string      `json:"capabilities"`
+    Capacity            map[string]string      `json:"capacity"`
+    DeploymentManagerId openapi_types.UUID     `json:"deploymentManagerId"`
+    Description         string                 `json:"description"`
+    Extensions          *map[string]interface{} `json:"extensions,omitempty"`
+    Name                string                 `json:"name"`
+    OCloudId            openapi_types.UUID     `json:"oCloudId"`
+    ServiceUri          string                 `json:"serviceUri"`
+    SupportedLocations  []string               `json:"supportedLocations"`
+}
+
+// OCloudInfo defines model for OCloudInfo.
+type OCloudInfo struct {
+    Description   string                  `json:"description"`
+    Extensions    *map[string]interface{} `json:"extensions,omitempty"`
+    GlobalcloudId openapi_types.UUID      `json:"globalcloudId"`
+    Name          string                  `json:"name"`
+    OCloudId      openapi_types.UUID      `json:"oCloudId"`
+    ServiceUri    string                  `json:"serviceUri"`
+}
+```
+
+#### Handler Interface (also readable Go)
+
+```go
+// StrictServerInterface represents all server handlers.
+type StrictServerInterface interface {
+    // Get information about the O-Cloud
+    GetCloudInfo(ctx context.Context, request GetCloudInfoRequestObject) (GetCloudInfoResponseObject, error)
+
+    // Get list of resource pools
+    GetResourcePools(ctx context.Context, request GetResourcePoolsRequestObject) (GetResourcePoolsResponseObject, error)
+
+    // Get a specific resource pool
+    GetResourcePool(ctx context.Context, request GetResourcePoolRequestObject) (GetResourcePoolResponseObject, error)
+    // ... more handlers
+}
+```
+
+#### Summary
+
+| Content | Readable? | Purpose |
+|---------|-----------|---------|
+| **Go struct types** | ✅ Yes | Data models (ResourcePool, Resource, etc.) |
+| **Handler interface** | ✅ Yes | Contract your `server.go` implements |
+| **Request/response types** | ✅ Yes | Type-safe API boundaries |
+| **Router registration** | ✅ Yes | HTTP routing code |
+| **Encoded OpenAPI spec** | ❌ No (base64) | Runtime request/response validation |
+
+The encoded spec is only ~5% of the file - the rest is **fully readable, well-documented Go code**.
+
+---
+
+### Question
+
+> The encoded spec is only used to validate, am I correct?
+
+### Answer
+
+### 14.5 Runtime OpenAPI Spec Usage
+
+**Yes, primarily for validation** - but also for **response filtering**.
+
+#### Two Uses of the Embedded OpenAPI Spec
+
+```go
+// internal/service/resources/serve.go
+func Serve(config *api.ResourceServerConfig) error {
+    // Load embedded spec
+    swagger, err := generated.GetSwagger()
+
+    // 1️⃣ SELF-VALIDATION: Validate the spec itself is correct
+    if err := swagger.Validate(context.Background(),
+        openapi3.EnableSchemaDefaultsValidation(),
+        openapi3.EnableSchemaFormatValidation(),
+        openapi3.EnableSchemaPatternValidation(),
+        openapi3.EnableExamplesValidation(),
+        openapi3.ProhibitExtensionsWithRef(),
+    ); err != nil {
+        return fmt.Errorf("failed validate swagger: %w", err)
+    }
+
+    // 2️⃣ RESPONSE FILTERING: Build filter adapter from spec
+    filterAdapter, err := middleware.NewFilterAdapterFromSwagger(logger, swagger)
+
+    opt := generated.StdHTTPServerOptions{
+        BaseRouter: baseRouter,
+        Middlewares: []generated.MiddlewareFunc{
+            // 3️⃣ REQUEST VALIDATION: Validate incoming requests against spec
+            middleware.OpenAPIValidation(swagger),
+
+            // 4️⃣ RESPONSE FILTERING: Apply ?fields, ?exclude_fields params
+            middleware.ResponseFilter(filterAdapter),
+
+            authz,
+            authn,
+            middleware.LogDuration(),
+        },
+    }
+}
+```
+
+#### Summary of Embedded Spec Usage
+
+| Use | What It Does |
+|-----|--------------|
+| **1. Self-validation** | Validates the OpenAPI spec itself is well-formed at startup |
+| **2. Request validation** | `OpenAPIValidation(swagger)` - Validates incoming HTTP requests match the spec |
+| **3. Response filtering** | `NewFilterAdapterFromSwagger()` - Supports O-RAN `?fields=`, `?exclude_fields=`, `?filter=` query params |
+
+#### What Uses the Go Structs Instead
+
+| Task | Uses |
+|------|------|
+| JSON serialization/deserialization | Go structs (`ResourcePool`, `Resource`, etc.) |
+| Handler type safety | `StrictServerInterface` |
+| Database model conversion | Go structs + your converter functions |
+| Business logic | Go structs in `server.go` |
+
+#### Visual Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                           WHAT USES WHAT AT RUNTIME                                          │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│   ENCODED OPENAPI SPEC (GetSwagger())                                                       │
+│   └── Used by:                                                                              │
+│       ├── middleware.OpenAPIValidation()  → Validate request params, body, types           │
+│       └── middleware.NewFilterAdapterFromSwagger() → Know field names for ?fields=         │
+│                                                                                             │
+│   GO STRUCTS (ResourcePool, Resource, etc.)                                                │
+│   └── Used by:                                                                              │
+│       ├── json.Marshal/Unmarshal → Serialize/deserialize JSON                              │
+│       ├── Handler functions → Type-safe request/response handling                          │
+│       ├── Database layer → Convert to/from DB models                                        │
+│       └── Business logic → All your actual code                                            │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The encoded spec is **only for validation and field introspection**, not for the actual data handling. The Go structs do all the real work!
+
+---
+
 ## Document Information
 
 - **Generated:** January 12, 2026
 - **Reviewed:** January 19, 2026 (corrections based on official docs)
+- **Updated:** January 21, 2026 (added Server Pattern section)
 - **Project:** O-RAN O2IMS Operator
 - **Repository:** `github.com/openshift-kni/oran-o2ims`
