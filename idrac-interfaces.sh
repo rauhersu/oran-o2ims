@@ -186,10 +186,10 @@ if [[ -z "$INTERFACE_URIS" ]]; then
 fi
 
 # Print header
-printf "%-25s %-20s %-12s %-30s %-12s %-10s %-20s\n" \
-    "iDRAC ID" "MAC Address" "Vendor" "Model" "Speed" "Link" "OS Iface (guessed)"
-printf "%-25s %-20s %-12s %-30s %-12s %-10s %-20s\n" \
-    "-------------------------" "--------------------" "------------" "------------------------------" "------------" "----------" "--------------------"
+printf "%-25s %-20s %-12s %-30s %-7s %-12s %-10s %-20s\n" \
+    "iDRAC ID" "MAC Address" "Vendor" "Model" "Ports" "Speed" "Link" "OS Iface (guessed)"
+printf "%-25s %-20s %-12s %-30s %-7s %-12s %-10s %-20s\n" \
+    "-------------------------" "--------------------" "------------" "------------------------------" "-------" "------------" "----------" "--------------------"
 
 # Iterate through each interface
 while IFS= read -r uri; do
@@ -211,12 +211,14 @@ while IFS= read -r uri; do
     
     # Get adapter info
     # Derive adapter ID based on interface type
+    # Note: For embedded NICs, Dell puts all ports under NIC.Embedded.1 adapter
     if [[ "$IDRAC_ID" =~ ^NIC\.Slot\.([0-9]+) ]]; then
         ADAPTER_KEY="NIC.Slot.${BASH_REMATCH[1]}"
     elif [[ "$IDRAC_ID" =~ ^NIC\.Integrated\.([0-9]+) ]]; then
         ADAPTER_KEY="NIC.Integrated.${BASH_REMATCH[1]}"
-    elif [[ "$IDRAC_ID" =~ ^NIC\.Embedded\.([0-9]+) ]]; then
-        ADAPTER_KEY="NIC.Embedded.${BASH_REMATCH[1]}"
+    elif [[ "$IDRAC_ID" =~ ^NIC\.Embedded\.[0-9]+-[0-9]+-[0-9]+$ ]]; then
+        # For embedded NICs, always use NIC.Embedded.1 as the adapter key
+        ADAPTER_KEY="NIC.Embedded.1"
     else
         ADAPTER_KEY=""
     fi
@@ -293,8 +295,8 @@ while IFS= read -r uri; do
     # Guess Linux name
     LINUX_NAME=$(guess_linux_name "$IDRAC_ID")
     
-    printf "%-25s %-20s %-12s %-30s %-12s %-10s %-20s\n" \
-        "$IDRAC_ID" "$MAC" "$VENDOR" "$SHORT_MODEL" "$DISPLAY_SPEED" "$LINK" "$LINUX_NAME"
+    printf "%-25s %-20s %-12s %-30s %-7s %-12s %-10s %-20s\n" \
+        "$IDRAC_ID" "$MAC" "$VENDOR" "$SHORT_MODEL" "$PORTS" "$DISPLAY_SPEED" "$LINK" "$LINUX_NAME"
     
 done <<< "$INTERFACE_URIS"
 
