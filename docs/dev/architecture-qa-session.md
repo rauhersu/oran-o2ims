@@ -32,6 +32,25 @@
     - [Deployment Creation by Inventory Controller](#143-deployment-creation-by-inventory-controller)
     - [OpenAPI Code Generation](#144-openapi-code-generation)
     - [Runtime OpenAPI Spec Usage](#145-runtime-openapi-spec-usage)
+15. [StrictServerInterface Deep Dive and Testing](#15-strictserverinterface-deep-dive-and-testing) *(Added January 26, 2026)*
+    - [StrictServerInterface Motivation and Creation](#151-strictserverinterface-motivation-and-creation)
+    - [Why StrictServerInterface is Excellent for Testability](#152-why-strictserverinterface-is-excellent-for-testability)
+    - [Existing Test Examples in the Codebase](#153-existing-test-examples-in-the-codebase)
+    - [How to Test Your V11 Inventory Updates](#154-how-to-test-your-v11-inventory-updates)
+    - [Testing Pattern Summary](#155-testing-pattern-summary)
+    - [Key Files for Reference](#156-key-files-for-reference)
+16. [Inventory Testing Assessment and Integration Testing Strategy](#16-inventory-testing-assessment-and-integration-testing-strategy) *(Added January 26, 2026)*
+    - [Current Testing Status for Resource Server](#161-current-testing-status-for-resource-server)
+    - [Types of Tests and Libraries Used](#162-types-of-tests-and-libraries-used)
+    - [Integration Testing Status](#163-integration-testing-status)
+    - [Testcontainers Assessment and Implementation Guide](#164-testcontainers-assessment-and-implementation-guide)
+    - [Detailed Implementation Guidance](#165-detailed-implementation-guidance)
+    - [Test Pattern Attribution](#166-test-pattern-attribution)
+17. [E2E Test Framework Deep Dive (Brent Rowsell)](#17-e2e-test-framework-deep-dive-brent-rowsell) *(Added January 26, 2026)*
+    - [E2E Test Framework Overview](#171-e2e-test-framework-overview)
+    - [Brent's Initial Contributions](#172-brents-initial-contributions)
+    - [Mock Hardware Plugin Server](#173-mock-hardware-plugin-server)
+    - [E2E Test Architecture Summary](#174-e2e-test-architecture-summary)
 
 ---
 
@@ -3325,10 +3344,1497 @@ The encoded spec is **only for validation and field introspection**, not for the
 
 ---
 
+## 15. StrictServerInterface Deep Dive and Testing
+
+*Added January 26, 2026*
+
+### Question
+
+> You mentioned that it is possible to Mock `StrictServerInterface` easily. I am interested in diving deeper:
+>
+> 1. Explain the StrictServerInterface motivation, how it was created.
+> 2. Explain why it is good for testability.
+> 3. Explain how can I use it to test my new inventory update according to v11 spec. Is there any test examples the current code use to leverage it? Could you provide a concise example of a possible test using that interface?
+
+### Answer
+
+#### 15.1 StrictServerInterface Motivation and Creation
+
+##### The Problem with Plain ServerInterface
+
+When `oapi-codegen` generates code with `std-http-server: true`, it creates a `ServerInterface` that uses raw HTTP primitives:
+
+```go
+// ServerInterface - Low-level HTTP handlers (NOT what we implement)
+type ServerInterface interface {
+    // Methods deal with raw HTTP
+    GetResourcePool(w http.ResponseWriter, r *http.Request, resourcePoolId ResourcePoolId)
+    GetResources(w http.ResponseWriter, r *http.Request, params GetResourcesParams)
+    // ...
+}
+```
+
+This interface is **difficult to implement** because:
+1. You must manually parse path parameters, query parameters, and request bodies
+2. You must manually write HTTP responses with correct status codes and content types
+3. Error handling is mixed with business logic
+4. Testing requires constructing `http.Request` and `httptest.ResponseRecorder`
+
+##### The Solution: StrictServerInterface
+
+When you add `strict-server: true` to the oapi-codegen config (as this project does), it generates a **cleaner interface**:
+
+```go
+// StrictServerInterface - Clean business logic handlers (what we implement!)
+type StrictServerInterface interface {
+    // Methods use strongly-typed Request/Response objects
+    GetResourcePool(ctx context.Context, request GetResourcePoolRequestObject) (GetResourcePoolResponseObject, error)
+    GetResources(ctx context.Context, request GetResourcesRequestObject) (GetResourcesResponseObject, error)
+    // ...
+}
+```
+
+##### How It Works - The Adapter Pattern
+
+The generated code creates a `strictHandler` struct that **adapts** between the two interfaces:
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│                        STRICT SERVER ADAPTER PATTERN                                        │
+├────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                            │
+│  HTTP Request                                                                              │
+│       │                                                                                    │
+│       ▼                                                                                    │
+│  ┌─────────────────┐                                                                       │
+│  │  ServerInterface│ ◄── Generated wrapper that Go's http.ServeMux calls                   │
+│  │  (raw HTTP)     │                                                                       │
+│  └────────┬────────┘                                                                       │
+│           │                                                                                │
+│           │ strictHandler.GetResourcePool(w, r, resourcePoolId)                            │
+│           │   1. Parses path params → GetResourcePoolRequestObject{ResourcePoolId: uuid}   │
+│           │   2. Calls your implementation                                                 │
+│           │   3. Handles response serialization                                            │
+│           │                                                                                │
+│           ▼                                                                                │
+│  ┌──────────────────────────┐                                                              │
+│  │ StrictServerInterface    │ ◄── YOUR implementation (ResourceServer)                     │
+│  │ (typed Go objects)       │                                                              │
+│  └──────────────────────────┘                                                              │
+│           │                                                                                │
+│           │ Returns GetResourcePool200JSONResponse{...} or                                 │
+│           │         GetResourcePool404ApplicationProblemPlusJSONResponse{...}              │
+│           │                                                                                │
+│           ▼                                                                                │
+│  strictHandler serializes response → HTTP Response                                         │
+│                                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### The Configuration That Enables This
+
+From `internal/service/resources/api/tools/oapi-codegen.yaml`:
+
+```yaml
+generate:
+  std-http-server: true   # Generates ServerInterface
+  strict-server: true     # ALSO generates StrictServerInterface + adapter
+  models: true            # Generate Go structs
+```
+
+##### Wiring It Together
+
+In `internal/service/resources/serve.go`:
+
+```go
+// Your server implements StrictServerInterface
+server := api.ResourceServer{
+    Config: config,
+    Repo:   repository,
+    // ...
+}
+
+// Wrap it with the strict handler adapter
+serverStrictHandler := generated.NewStrictHandlerWithOptions(&server, nil,
+    generated.StrictHTTPServerOptions{
+        RequestErrorHandlerFunc:  middleware.GetOranReqErrFunc(),
+        ResponseErrorHandlerFunc: middleware.GetOranRespErrFunc(),
+    },
+)
+
+// Register with HTTP router (serverStrictHandler implements ServerInterface)
+generated.HandlerWithOptions(serverStrictHandler, opt)
+```
+
+#### 15.2 Why StrictServerInterface is Excellent for Testability
+
+##### 1. Pure Business Logic Testing (No HTTP Ceremony)
+
+```go
+// Without StrictServerInterface - testing is painful
+func TestGetResourcePool_OldWay(t *testing.T) {
+    req := httptest.NewRequest("GET", "/resourcePools/123", nil)
+    w := httptest.NewRecorder()
+    
+    server.GetResourcePool(w, req, uuid.MustParse("123..."))
+    
+    // Must parse response body
+    var result api.ResourcePool
+    json.Unmarshal(w.Body.Bytes(), &result)
+    // Must check status code
+    assert.Equal(t, 200, w.Code)
+}
+
+// With StrictServerInterface - testing is clean
+func TestGetResourcePool_StrictWay(t *testing.T) {
+    resp, err := server.GetResourcePool(ctx, api.GetResourcePoolRequestObject{
+        ResourcePoolId: testUUID,
+    })
+    
+    // Type-safe response!
+    assert.IsType(t, api.GetResourcePool200JSONResponse{}, resp)
+    assert.Equal(t, testUUID, resp.(api.GetResourcePool200JSONResponse).ResourcePoolId)
+}
+```
+
+##### 2. Type-Safe Response Assertions
+
+Each possible response has its own Go type:
+
+```go
+// These are DIFFERENT types - compiler helps you!
+GetResourcePool200JSONResponse{}                           // Success
+GetResourcePool404ApplicationProblemPlusJSONResponse{}     // Not found
+GetResourcePool500ApplicationProblemPlusJSONResponse{}     // Server error
+```
+
+You can use `BeAssignableToTypeOf()` in tests to verify the exact response type.
+
+##### 3. No HTTP Infrastructure Required
+
+You don't need:
+- HTTP server running
+- Network sockets
+- `httptest.NewRecorder()`
+- URL parsing
+
+Just call methods directly with Go objects.
+
+##### 4. Easy Mocking of Dependencies
+
+The real power comes from mocking the **repository layer**, not the server itself:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                           TESTING ARCHITECTURE                                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│  TEST CODE                                                                                  │
+│       │                                                                                     │
+│       ▼                                                                                     │
+│  ┌──────────────────────────────────┐                                                       │
+│  │  ResourceServer                   │ ◄── Real server struct                               │
+│  │  (implements StrictServerInterface│                                                      │
+│  │                                   │                                                      │
+│  │  Repo: MockRepositoryInterface   │ ◄── MOCK injected here!                              │
+│  └──────────────────────────────────┘                                                       │
+│                                                                                             │
+│  The mock repository controls what the server "sees" from the database                      │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 15.3 Existing Test Examples in the Codebase
+
+The project already has excellent test examples. Let me show you the patterns:
+
+##### Example 1: ClusterServer Tests
+
+From `internal/service/cluster/api/server_test.go`:
+
+```go
+var _ = Describe("Cluster Server", func() {
+    var (
+        ctrl     *gomock.Controller
+        mockRepo *generated.MockRepositoryInterface  // Generated mock!
+        server   *ClusterServer
+        ctx      context.Context
+        testUUID uuid.UUID
+    )
+
+    BeforeEach(func() {
+        ctrl = gomock.NewController(GinkgoT())
+        mockRepo = generated.NewMockRepositoryInterface(ctrl)
+        server = &ClusterServer{
+            Repo: mockRepo,  // Inject mock
+        }
+        ctx = context.Background()
+        testUUID = uuid.New()
+    })
+
+    Describe("GetNodeClusterTypeAlarmDictionary", func() {
+        When("repository returns error", func() {
+            It("returns internal server error", func() {
+                // ARRANGE: Set up mock expectation
+                mockRepo.EXPECT().
+                    GetNodeClusterTypeAlarmDictionary(ctx, testUUID).
+                    Return(nil, fmt.Errorf("db error"))
+
+                // ACT: Call the method directly (no HTTP!)
+                resp, err := server.GetNodeClusterTypeAlarmDictionary(ctx,
+                    apigenerated.GetNodeClusterTypeAlarmDictionaryRequestObject{
+                        NodeClusterTypeId: testUUID,
+                    })
+
+                // ASSERT: Type-safe checks
+                Expect(err).To(BeNil())
+                Expect(resp).To(BeAssignableToTypeOf(
+                    apigenerated.GetNodeClusterTypeAlarmDictionary500ApplicationProblemPlusJSONResponse{}))
+                Expect(resp.(apigenerated.GetNodeClusterTypeAlarmDictionary500ApplicationProblemPlusJSONResponse).
+                    Status).To(Equal(http.StatusInternalServerError))
+            })
+        })
+
+        When("repository does not have the alarm dictionary", func() {
+            It("returns 404 not found response", func() {
+                mockRepo.EXPECT().
+                    GetNodeClusterTypeAlarmDictionary(ctx, testUUID).
+                    Return([]models.AlarmDictionary{}, nil)  // Empty = not found
+
+                resp, err := server.GetNodeClusterTypeAlarmDictionary(ctx,
+                    apigenerated.GetNodeClusterTypeAlarmDictionaryRequestObject{
+                        NodeClusterTypeId: testUUID,
+                    })
+
+                Expect(err).To(BeNil())
+                Expect(resp).To(BeAssignableToTypeOf(
+                    apigenerated.GetNodeClusterTypeAlarmDictionary404ApplicationProblemPlusJSONResponse{}))
+            })
+        })
+
+        When("alarm dictionary and definitions are found", func() {
+            It("returns 200 OK", func() {
+                alarmDefinitionUUID := uuid.New()
+                
+                // First call returns dictionary
+                mockRepo.EXPECT().
+                    GetNodeClusterTypeAlarmDictionary(ctx, testUUID).
+                    Return([]models.AlarmDictionary{
+                        {AlarmDictionaryID: testUUID},
+                    }, nil)
+                
+                // Second call returns definitions
+                mockRepo.EXPECT().
+                    GetAlarmDefinitionsByAlarmDictionaryID(ctx, testUUID).
+                    Return([]models.AlarmDefinition{
+                        {AlarmDefinitionID: alarmDefinitionUUID},
+                    }, nil)
+
+                resp, err := server.GetNodeClusterTypeAlarmDictionary(ctx,
+                    apigenerated.GetNodeClusterTypeAlarmDictionaryRequestObject{
+                        NodeClusterTypeId: testUUID,
+                    })
+
+                Expect(err).To(BeNil())
+                Expect(resp).To(BeAssignableToTypeOf(
+                    apigenerated.GetNodeClusterTypeAlarmDictionary200JSONResponse{}))
+                // Type assertion gives you full access to response fields!
+                okResp := resp.(apigenerated.GetNodeClusterTypeAlarmDictionary200JSONResponse)
+                Expect(okResp.AlarmDictionaryId).To(Equal(testUUID))
+                Expect(okResp.AlarmDefinition).To(HaveLen(1))
+            })
+        })
+    })
+})
+```
+
+##### Example 2: AlarmsServer Tests
+
+From `internal/service/alarms/api/server_test.go`:
+
+```go
+var _ = Describe("AlarmsServer", func() {
+    var (
+        ctrl     *gomock.Controller
+        mockRepo *generated.MockAlarmRepositoryInterface
+        server   *api.AlarmsServer
+        ctx      context.Context
+        testUUID uuid.UUID
+    )
+
+    BeforeEach(func() {
+        ctrl = gomock.NewController(GinkgoT())
+        mockRepo = generated.NewMockAlarmRepositoryInterface(ctrl)
+        server = &api.AlarmsServer{AlarmsRepository: mockRepo}
+        ctx = context.Background()
+        testUUID = uuid.New()
+    })
+
+    Describe("GetAlarm", func() {
+        When("alarm not found", func() {
+            It("returns 404 response", func() {
+                mockRepo.EXPECT().
+                    GetAlarmEventRecord(ctx, testUUID).
+                    Return(nil, svcutils.ErrNotFound)  // Special sentinel error
+
+                resp, err := server.GetAlarm(ctx, alarmapi.GetAlarmRequestObject{
+                    AlarmEventRecordId: testUUID,
+                })
+
+                Expect(err).NotTo(HaveOccurred())
+                problemResp := resp.(alarmapi.GetAlarm404ApplicationProblemPlusJSONResponse)
+                Expect(problemResp.Status).To(Equal(http.StatusNotFound))
+            })
+        })
+
+        When("repository is unavailable", func() {
+            It("returns error", func() {
+                mockRepo.EXPECT().
+                    GetAlarmEventRecord(ctx, testUUID).
+                    Return(nil, fmt.Errorf("db error"))
+
+                resp, err := server.GetAlarm(ctx, alarmapi.GetAlarmRequestObject{
+                    AlarmEventRecordId: testUUID,
+                })
+
+                Expect(err).To(HaveOccurred())  // Non-recoverable errors
+                Expect(resp).To(BeNil())
+            })
+        })
+    })
+})
+```
+
+#### 15.4 How to Test Your V11 Inventory Updates
+
+##### Step 1: Define Repository Interface (if not exists)
+
+The resource server currently uses a concrete `*repo.ResourcesRepository` struct. For testability, you should define an interface:
+
+```go
+// internal/service/resources/db/repo/repository_interface.go
+package repo
+
+//go:generate mockgen -source=repository_interface.go -destination=generated/mock_repo.generated.go -package=generated
+
+type ResourcesRepositoryInterface interface {
+    GetResourcePools(ctx context.Context) ([]models.ResourcePool, error)
+    GetResourcePool(ctx context.Context, id uuid.UUID) (*models.ResourcePool, error)
+    GetResources(ctx context.Context, poolId uuid.UUID) ([]models.Resource, error)
+    GetResource(ctx context.Context, id uuid.UUID) (*models.Resource, error)
+    // Add all methods you need...
+}
+```
+
+##### Step 2: Update Server to Use Interface
+
+```go
+// internal/service/resources/api/server.go
+type ResourceServer struct {
+    Config                   *ResourceServerConfig
+    Info                     api.OCloudInfo
+    Repo                     repo.ResourcesRepositoryInterface  // Interface, not concrete!
+    SubscriptionEventHandler notifier.SubscriptionEventHandler
+}
+```
+
+##### Step 3: Generate Mocks
+
+```bash
+cd internal/service/resources/db/repo
+go generate ./...
+# Creates generated/mock_repo.generated.go
+```
+
+##### Step 4: Write Your Tests
+
+Here's a **complete example** for testing a new v11 endpoint:
+
+```go
+// internal/service/resources/api/server_test.go
+package api_test
+
+import (
+    "context"
+    "fmt"
+    "net/http"
+    "testing"
+
+    "github.com/google/uuid"
+    . "github.com/onsi/ginkgo/v2"
+    . "github.com/onsi/gomega"
+    "go.uber.org/mock/gomock"
+
+    "github.com/openshift-kni/oran-o2ims/internal/service/resources/api"
+    apigenerated "github.com/openshift-kni/oran-o2ims/internal/service/resources/api/generated"
+    "github.com/openshift-kni/oran-o2ims/internal/service/resources/db/models"
+    "github.com/openshift-kni/oran-o2ims/internal/service/resources/db/repo/generated"
+    svcutils "github.com/openshift-kni/oran-o2ims/internal/service/common/utils"
+)
+
+var _ = Describe("ResourceServer", func() {
+    var (
+        ctrl     *gomock.Controller
+        mockRepo *generated.MockResourcesRepositoryInterface
+        server   *api.ResourceServer
+        ctx      context.Context
+    )
+
+    BeforeEach(func() {
+        ctrl = gomock.NewController(GinkgoT())
+        mockRepo = generated.NewMockResourcesRepositoryInterface(ctrl)
+        server = &api.ResourceServer{
+            Repo: mockRepo,
+            Info: apigenerated.OCloudInfo{
+                OCloudId: uuid.New(),
+            },
+        }
+        ctx = context.Background()
+    })
+
+    AfterEach(func() {
+        ctrl.Finish()
+    })
+
+    // ==========================================================================
+    // EXAMPLE: Testing GetResourcePool (existing endpoint)
+    // ==========================================================================
+    Describe("GetResourcePool", func() {
+        var testPoolID uuid.UUID
+
+        BeforeEach(func() {
+            testPoolID = uuid.New()
+        })
+
+        When("resource pool exists", func() {
+            It("returns 200 with the pool data", func() {
+                // ARRANGE
+                expectedPool := &models.ResourcePool{
+                    ResourcePoolID: testPoolID,
+                    Name:           "test-pool",
+                    Description:    "Test pool description",
+                    OCloudID:       uuid.New(),
+                }
+                mockRepo.EXPECT().
+                    GetResourcePool(ctx, testPoolID).
+                    Return(expectedPool, nil)
+
+                // ACT
+                resp, err := server.GetResourcePool(ctx,
+                    apigenerated.GetResourcePoolRequestObject{
+                        ResourcePoolId: testPoolID,
+                    })
+
+                // ASSERT
+                Expect(err).ToNot(HaveOccurred())
+                Expect(resp).To(BeAssignableToTypeOf(apigenerated.GetResourcePool200JSONResponse{}))
+                
+                okResp := resp.(apigenerated.GetResourcePool200JSONResponse)
+                Expect(okResp.ResourcePoolId).To(Equal(testPoolID))
+                Expect(okResp.Name).To(Equal("test-pool"))
+            })
+        })
+
+        When("resource pool does not exist", func() {
+            It("returns 404 with problem details", func() {
+                // ARRANGE
+                mockRepo.EXPECT().
+                    GetResourcePool(ctx, testPoolID).
+                    Return(nil, svcutils.ErrNotFound)
+
+                // ACT
+                resp, err := server.GetResourcePool(ctx,
+                    apigenerated.GetResourcePoolRequestObject{
+                        ResourcePoolId: testPoolID,
+                    })
+
+                // ASSERT
+                Expect(err).ToNot(HaveOccurred())
+                Expect(resp).To(BeAssignableToTypeOf(
+                    apigenerated.GetResourcePool404ApplicationProblemPlusJSONResponse{}))
+                
+                notFoundResp := resp.(apigenerated.GetResourcePool404ApplicationProblemPlusJSONResponse)
+                Expect(notFoundResp.Status).To(Equal(http.StatusNotFound))
+                Expect(notFoundResp.Detail).To(ContainSubstring("not found"))
+            })
+        })
+
+        When("database returns an error", func() {
+            It("returns 500 with problem details", func() {
+                // ARRANGE
+                mockRepo.EXPECT().
+                    GetResourcePool(ctx, testPoolID).
+                    Return(nil, fmt.Errorf("connection refused"))
+
+                // ACT
+                resp, err := server.GetResourcePool(ctx,
+                    apigenerated.GetResourcePoolRequestObject{
+                        ResourcePoolId: testPoolID,
+                    })
+
+                // ASSERT
+                Expect(err).ToNot(HaveOccurred())
+                Expect(resp).To(BeAssignableToTypeOf(
+                    apigenerated.GetResourcePool500ApplicationProblemPlusJSONResponse{}))
+            })
+        })
+    })
+
+    // ==========================================================================
+    // EXAMPLE: Testing a NEW v11 endpoint (hypothetical)
+    // ==========================================================================
+    Describe("GetResourcePoolCapacity (v11 new endpoint)", func() {
+        // Assuming v11 adds a new endpoint: GET /resourcePools/{id}/capacity
+        
+        var testPoolID uuid.UUID
+
+        BeforeEach(func() {
+            testPoolID = uuid.New()
+        })
+
+        When("resource pool exists and has capacity info", func() {
+            It("returns 200 with capacity data", func() {
+                // ARRANGE - Mock returns pool with capacity extensions
+                mockRepo.EXPECT().
+                    GetResourcePool(ctx, testPoolID).
+                    Return(&models.ResourcePool{
+                        ResourcePoolID: testPoolID,
+                        Extensions: map[string]interface{}{
+                            "capacity": map[string]interface{}{
+                                "cpu":    "1000",
+                                "memory": "2048Gi",
+                            },
+                        },
+                    }, nil)
+
+                // ACT
+                resp, err := server.GetResourcePoolCapacity(ctx,
+                    apigenerated.GetResourcePoolCapacityRequestObject{
+                        ResourcePoolId: testPoolID,
+                    })
+
+                // ASSERT
+                Expect(err).ToNot(HaveOccurred())
+                Expect(resp).To(BeAssignableToTypeOf(
+                    apigenerated.GetResourcePoolCapacity200JSONResponse{}))
+                
+                okResp := resp.(apigenerated.GetResourcePoolCapacity200JSONResponse)
+                Expect(okResp.Capacity["cpu"]).To(Equal("1000"))
+            })
+        })
+    })
+})
+
+// Don't forget the test suite setup!
+func TestResourceServer(t *testing.T) {
+    RegisterFailHandler(Fail)
+    RunSpecs(t, "Resource Server Suite")
+}
+```
+
+##### Step 5: Run Your Tests
+
+```bash
+# Run all tests in the package
+cd internal/service/resources/api
+go test -v ./...
+
+# Run with Ginkgo for better output
+ginkgo -v ./...
+
+# Run specific test
+ginkgo -v --focus="GetResourcePool" ./...
+```
+
+#### 15.5 Testing Pattern Summary
+
+| Layer | What to Test | How to Test |
+|-------|--------------|-------------|
+| **StrictServerInterface implementation** | Business logic | Mock repository, call methods directly |
+| **Repository** | SQL queries | Integration tests with test DB |
+| **Models transformation** | ToModel/FromModel | Unit tests with static data |
+| **OpenAPI validation** | Request/response format | Integration tests via HTTP |
+
+#### 15.6 Key Files for Reference
+
+| Purpose | File |
+|---------|------|
+| ClusterServer tests | `internal/service/cluster/api/server_test.go` |
+| AlarmsServer tests | `internal/service/alarms/api/server_test.go` |
+| Mock generation directive | `internal/service/cluster/db/repo/repository_interface.go` |
+| Generated mock | `internal/service/cluster/db/repo/generated/mock_repo.generated.go` |
+| Test suite setup | `internal/service/cluster/api/suite_test.go` |
+
+#### Visual Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                    STRICTSERVERINTERFACE TESTING WORKFLOW                                   │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                             │
+│  1. DEFINE INTERFACE                                                                        │
+│     repository_interface.go                                                                 │
+│     └── //go:generate mockgen ...                                                           │
+│                                                                                             │
+│  2. GENERATE MOCK                                                                           │
+│     $ go generate ./...                                                                     │
+│     └── Creates mock_repo.generated.go                                                      │
+│                                                                                             │
+│  3. WRITE TEST                                                                              │
+│     ┌─────────────────────────────────────────────────────────────────────────────────┐     │
+│     │  BeforeEach:                                                                    │     │
+│     │    mockRepo = generated.NewMockRepositoryInterface(ctrl)                        │     │
+│     │    server = &ResourceServer{Repo: mockRepo}                                     │     │
+│     │                                                                                 │     │
+│     │  It("returns 200..."):                                                          │     │
+│     │    mockRepo.EXPECT().GetResourcePool(ctx, id).Return(pool, nil)                 │     │
+│     │    resp, err := server.GetResourcePool(ctx, request)                            │     │
+│     │    Expect(resp).To(BeAssignableToTypeOf(Get...200JSONResponse{}))               │     │
+│     └─────────────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                             │
+│  4. RUN                                                                                     │
+│     $ ginkgo -v ./...                                                                       │
+│                                                                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The `StrictServerInterface` pattern transforms API testing from "HTTP integration tests" into "pure Go function tests", making them faster, more reliable, and easier to write!
+
+---
+
+## 16. Inventory Testing Assessment and Integration Testing Strategy
+
+*Added January 26, 2026*
+
+### Question
+
+> Examine the current inventory tests, I mean, everything what can be testing the o2ims_infrastructureInventory. Specifically, I want to know:
+>
+> 1. Type of test: is that unit test using mocks exclusively? And external libraries we might be using for testing purposes.
+> 2. Do we have integration testing in this project? Wondering if there is something to start up a postgres db (maybe a container) so the inventory rest interface can be tested entirely (rest request, db query and rest response).
+> 3. I want you to assess the testcontainers library: https://testcontainers.com/ to that end in the previous item.
+
+### Answer
+
+#### 16.1 Current Testing Status for Resource Server (Inventory API)
+
+##### Critical Finding: Almost No Tests for the Inventory API Handlers!
+
+The `internal/service/resources/` directory has **only 2 test files**, both in the `listener/` subdirectory:
+
+```
+internal/service/resources/
+├── listener/
+│   ├── suite_test.go        # Ginkgo test suite setup
+│   └── alarms_sync_test.go  # Tests for alarm dictionary sync functions
+├── api/
+│   └── server.go            # ⚠️ NO server_test.go!
+├── db/repo/
+│   └── repository.go        # ⚠️ NO repository_test.go!
+```
+
+**This is a significant gap** compared to other services:
+
+| Service | Has `server_test.go` | Has `repository_test.go` | Test Coverage |
+|---------|---------------------|-------------------------|---------------|
+| **resource-server** (Inventory) | ❌ NO | ❌ NO | **Very Low** |
+| **cluster-server** | ✅ YES | ✅ YES (with mocks) | Good |
+| **alarms-server** | ✅ YES | ✅ YES (with pgxmock) | Good |
+| **provisioning-server** | ❌ NO | N/A (no DB) | Low |
+
+#### 16.2 Types of Tests and Libraries Used
+
+##### Testing Framework Stack
+
+| Library | Purpose | go.mod Version |
+|---------|---------|----------------|
+| **Ginkgo v2** | BDD-style test framework | `github.com/onsi/ginkgo/v2 v2.27.3` |
+| **Gomega** | Assertion/matcher library | `github.com/onsi/gomega v1.38.0` |
+| **gomock** | Interface mocking | `go.uber.org/mock v0.5.2` |
+| **pgxmock** | PostgreSQL mock for pgx | `github.com/pashagolub/pgxmock/v4 v4.9.0` |
+
+##### Test Types Currently Used
+
+| Test Type | Used? | Where | Pattern |
+|-----------|-------|-------|---------|
+| **Unit tests with mocks** | ✅ Yes | `cluster/api/server_test.go`, `alarms/api/server_test.go` | Mock repository, test StrictServerInterface |
+| **Repository tests with pgxmock** | ✅ Yes | `alarms/internal/db/repo/alarms_repository_test.go` | Mock SQL queries/results |
+| **Controller tests with envtest** | ✅ Yes | `internal/controllers/*_test.go` | Fake K8s API server |
+| **Integration tests with real DB** | ❌ NO | - | Not implemented |
+| **E2E tests** | ✅ Yes | `test/e2e/e2e_suite_test.go` | Full cluster required |
+
+##### Example: How Mocking Works in This Project
+
+**1. Repository Interface Mocking (gomock)**
+
+```go
+// internal/service/cluster/db/repo/repository_interface.go
+//go:generate mockgen -source=repository_interface.go -destination=generated/mock_repo.generated.go -package=generated
+
+type RepositoryInterface interface {
+    GetNodeClusterTypes(ctx context.Context) ([]models.NodeClusterType, error)
+    GetNodeClusterType(ctx context.Context, id uuid.UUID) (*models.NodeClusterType, error)
+    // ...
+}
+```
+
+**2. SQL Mocking (pgxmock)**
+
+```go
+// internal/service/alarms/internal/db/repo/alarms_repository_test.go
+mock, err := pgxmock.NewPool()
+mock.ExpectQuery(`SELECT .* FROM alarm_event_record`).
+    WithArgs(testUUID).
+    WillReturnRows(pgxmock.NewRows(columns).AddRow(values...))
+```
+
+#### 16.3 Integration Testing Status
+
+##### Current State: No Database Integration Tests
+
+The project currently has **NO integration tests** that:
+- Start a real PostgreSQL database
+- Run the actual server code against it
+- Test the full request → handler → repository → DB → response flow
+
+##### Why This Matters for Your V11 Work
+
+When you update the Inventory API for v11:
+- **Schema changes** (new columns, tables) need DB migration testing
+- **Query changes** need validation against real PostgreSQL behavior
+- **JSON/JSONB handling** behaves differently in real DB vs mocks
+- **Concurrent access patterns** can't be tested with mocks
+
+#### 16.4 Testcontainers Assessment and Implementation Guide
+
+##### What is Testcontainers?
+
+[Testcontainers](https://testcontainers.com/) is a library that provides lightweight, throwaway instances of databases, message brokers, or any service that can run in a Docker container. For Go, it's available as `testcontainers-go`.
+
+##### Why Testcontainers is Excellent for This Project
+
+| Benefit | How It Helps O2IMS |
+|---------|-------------------|
+| **Real PostgreSQL** | Test actual SQL queries, JSONB operations, migrations |
+| **Isolated per test** | Each test gets a fresh database |
+| **CI/CD friendly** | Works in GitHub Actions, Tekton pipelines |
+| **No external dependencies** | Just needs Docker |
+| **Fast startup** | PostgreSQL container starts in ~2-3 seconds |
+
+##### Testcontainers-Go PostgreSQL Module
+
+```go
+import (
+    "github.com/testcontainers/testcontainers-go"
+    "github.com/testcontainers/testcontainers-go/modules/postgres"
+    "github.com/testcontainers/testcontainers-go/wait"
+)
+```
+
+#### 16.5 Detailed Implementation Guidance
+
+##### Step 1: Add Testcontainers Dependency
+
+```bash
+# Add to go.mod
+go get github.com/testcontainers/testcontainers-go
+go get github.com/testcontainers/testcontainers-go/modules/postgres
+
+# Update vendor
+go mod tidy
+go mod vendor
+```
+
+##### Step 2: Create Test Helper for PostgreSQL Container
+
+Create a new file `internal/service/resources/db/testhelpers/postgres_container.go`:
+
+```go
+package testhelpers
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "github.com/jackc/pgx/v5/pgxpool"
+    "github.com/testcontainers/testcontainers-go"
+    "github.com/testcontainers/testcontainers-go/modules/postgres"
+    "github.com/testcontainers/testcontainers-go/wait"
+)
+
+// PostgresContainer wraps a testcontainers PostgreSQL instance
+type PostgresContainer struct {
+    Container testcontainers.Container
+    Pool      *pgxpool.Pool
+    ConnStr   string
+}
+
+// NewPostgresContainer creates a new PostgreSQL container for testing
+func NewPostgresContainer(ctx context.Context) (*PostgresContainer, error) {
+    // Start PostgreSQL container
+    pgContainer, err := postgres.Run(ctx,
+        "docker.io/postgres:16-alpine",
+        postgres.WithDatabase("resources_test"),
+        postgres.WithUsername("test"),
+        postgres.WithPassword("test"),
+        testcontainers.WithWaitStrategy(
+            wait.ForLog("database system is ready to accept connections").
+                WithOccurrence(2).
+                WithStartupTimeout(30*time.Second),
+        ),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to start postgres container: %w", err)
+    }
+
+    // Get connection string
+    connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+    if err != nil {
+        pgContainer.Terminate(ctx)
+        return nil, fmt.Errorf("failed to get connection string: %w", err)
+    }
+
+    // Create connection pool
+    pool, err := pgxpool.New(ctx, connStr)
+    if err != nil {
+        pgContainer.Terminate(ctx)
+        return nil, fmt.Errorf("failed to create pool: %w", err)
+    }
+
+    return &PostgresContainer{
+        Container: pgContainer,
+        Pool:      pool,
+        ConnStr:   connStr,
+    }, nil
+}
+
+// RunMigrations applies database migrations
+func (pc *PostgresContainer) RunMigrations(ctx context.Context, migrationsPath string) error {
+    // Use the same migration logic as the production code
+    // This ensures migrations are tested too!
+    migrator, err := migrate.New(
+        "file://"+migrationsPath,
+        pc.ConnStr,
+    )
+    if err != nil {
+        return fmt.Errorf("failed to create migrator: %w", err)
+    }
+    defer migrator.Close()
+
+    if err := migrator.Up(); err != nil && err != migrate.ErrNoChange {
+        return fmt.Errorf("failed to run migrations: %w", err)
+    }
+    return nil
+}
+
+// Cleanup terminates the container and closes connections
+func (pc *PostgresContainer) Cleanup(ctx context.Context) error {
+    if pc.Pool != nil {
+        pc.Pool.Close()
+    }
+    if pc.Container != nil {
+        return pc.Container.Terminate(ctx)
+    }
+    return nil
+}
+
+// TruncateTables clears all data for test isolation
+func (pc *PostgresContainer) TruncateTables(ctx context.Context, tables ...string) error {
+    for _, table := range tables {
+        _, err := pc.Pool.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s CASCADE", table))
+        if err != nil {
+            return fmt.Errorf("failed to truncate %s: %w", table, err)
+        }
+    }
+    return nil
+}
+```
+
+##### Step 3: Create Integration Test Suite
+
+Create `internal/service/resources/api/integration_test.go`:
+
+```go
+//go:build integration
+// +build integration
+
+package api_test
+
+import (
+    "context"
+    "net/http"
+    "testing"
+    "time"
+
+    "github.com/google/uuid"
+    . "github.com/onsi/ginkgo/v2"
+    . "github.com/onsi/gomega"
+
+    "github.com/openshift-kni/oran-o2ims/internal/service/resources/api"
+    "github.com/openshift-kni/oran-o2ims/internal/service/resources/api/generated"
+    "github.com/openshift-kni/oran-o2ims/internal/service/resources/db/models"
+    "github.com/openshift-kni/oran-o2ims/internal/service/resources/db/repo"
+    "github.com/openshift-kni/oran-o2ims/internal/service/resources/db/testhelpers"
+)
+
+var (
+    pgContainer *testhelpers.PostgresContainer
+    repository  *repo.ResourcesRepository
+    server      *api.ResourceServer
+    ctx         context.Context
+)
+
+var _ = BeforeSuite(func() {
+    var err error
+    ctx = context.Background()
+
+    // Start PostgreSQL container (once for all tests)
+    pgContainer, err = testhelpers.NewPostgresContainer(ctx)
+    Expect(err).NotTo(HaveOccurred())
+
+    // Run migrations
+    err = pgContainer.RunMigrations(ctx, "../db/migrations")
+    Expect(err).NotTo(HaveOccurred())
+
+    // Create repository with real DB connection
+    repository = repo.NewResourcesRepository(pgContainer.Pool)
+
+    // Create server with real repository
+    server = &api.ResourceServer{
+        Repo: repository,
+        Info: generated.OCloudInfo{
+            OCloudId:      uuid.New(),
+            GlobalcloudId: uuid.New(),
+            Name:          "test-cloud",
+            Description:   "Test O-Cloud",
+            ServiceUri:    "https://test.example.com",
+        },
+    }
+})
+
+var _ = AfterSuite(func() {
+    if pgContainer != nil {
+        pgContainer.Cleanup(ctx)
+    }
+})
+
+var _ = Describe("ResourceServer Integration Tests", func() {
+    // Clean database before each test
+    BeforeEach(func() {
+        err := pgContainer.TruncateTables(ctx,
+            "resource",
+            "resource_pool",
+            "resource_type",
+            "data_source",
+        )
+        Expect(err).NotTo(HaveOccurred())
+    })
+
+    Describe("GetResourcePools", func() {
+        When("database is empty", func() {
+            It("returns empty list", func() {
+                resp, err := server.GetResourcePools(ctx,
+                    generated.GetResourcePoolsRequestObject{})
+
+                Expect(err).NotTo(HaveOccurred())
+                Expect(resp).To(BeAssignableToTypeOf(
+                    generated.GetResourcePools200JSONResponse{}))
+
+                okResp := resp.(generated.GetResourcePools200JSONResponse)
+                Expect(okResp).To(BeEmpty())
+            })
+        })
+
+        When("database has resource pools", func() {
+            var testPoolID uuid.UUID
+
+            BeforeEach(func() {
+                testPoolID = uuid.New()
+                // Insert test data directly into DB
+                _, err := pgContainer.Pool.Exec(ctx, `
+                    INSERT INTO data_source (data_source_id, name)
+                    VALUES ($1, 'test-source')
+                `, uuid.New())
+                Expect(err).NotTo(HaveOccurred())
+
+                _, err = pgContainer.Pool.Exec(ctx, `
+                    INSERT INTO resource_pool (
+                        resource_pool_id, name, description,
+                        o_cloud_id, global_location_id,
+                        data_source_id, generation_id, external_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                `, testPoolID, "test-pool", "Test Pool",
+                    server.Info.OCloudId, uuid.New(),
+                    uuid.New(), 1, "ext-1")
+                Expect(err).NotTo(HaveOccurred())
+            })
+
+            It("returns the resource pools", func() {
+                resp, err := server.GetResourcePools(ctx,
+                    generated.GetResourcePoolsRequestObject{})
+
+                Expect(err).NotTo(HaveOccurred())
+                okResp := resp.(generated.GetResourcePools200JSONResponse)
+                Expect(okResp).To(HaveLen(1))
+                Expect(okResp[0].ResourcePoolId).To(Equal(testPoolID))
+                Expect(okResp[0].Name).To(Equal("test-pool"))
+            })
+        })
+    })
+
+    Describe("GetResourcePool", func() {
+        var testPoolID uuid.UUID
+
+        BeforeEach(func() {
+            testPoolID = uuid.New()
+            // Setup test data...
+        })
+
+        When("resource pool exists", func() {
+            It("returns the pool with all fields", func() {
+                resp, err := server.GetResourcePool(ctx,
+                    generated.GetResourcePoolRequestObject{
+                        ResourcePoolId: testPoolID,
+                    })
+
+                Expect(err).NotTo(HaveOccurred())
+                Expect(resp).To(BeAssignableToTypeOf(
+                    generated.GetResourcePool200JSONResponse{}))
+            })
+        })
+
+        When("resource pool does not exist", func() {
+            It("returns 404", func() {
+                resp, err := server.GetResourcePool(ctx,
+                    generated.GetResourcePoolRequestObject{
+                        ResourcePoolId: uuid.New(), // Non-existent
+                    })
+
+                Expect(err).NotTo(HaveOccurred())
+                Expect(resp).To(BeAssignableToTypeOf(
+                    generated.GetResourcePool404ApplicationProblemPlusJSONResponse{}))
+            })
+        })
+    })
+
+    // Test V11 specific features
+    Describe("V11 Features", func() {
+        Describe("ResourcePool with capacity fields", func() {
+            It("correctly stores and retrieves capacity in extensions", func() {
+                // Test new v11 fields like capacity, usedCapacity
+                // This validates both the schema and the handler logic
+            })
+        })
+
+        Describe("ResourceType with resourceClass enum", func() {
+            It("validates resourceClass values", func() {
+                // Test COMPUTE, NETWORKING, STORAGE, UNDEFINED
+            })
+        })
+    })
+})
+
+func TestIntegration(t *testing.T) {
+    RegisterFailHandler(Fail)
+    RunSpecs(t, "Resource Server Integration Suite")
+}
+```
+
+##### Step 4: Add Makefile Target for Integration Tests
+
+Add to `Makefile`:
+
+```makefile
+.PHONY: test-integration
+test-integration: ## Run integration tests (requires Docker)
+	@echo "Running integration tests with testcontainers..."
+	go test -tags=integration -v ./internal/service/resources/... -timeout 5m
+
+.PHONY: test-all
+test-all: test test-integration ## Run all tests (unit + integration)
+```
+
+##### Step 5: CI/CD Configuration
+
+For GitHub Actions (`.github/workflows/test.yaml`):
+
+```yaml
+jobs:
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run integration tests
+        run: make test-integration
+```
+
+For Tekton (`.tekton/integration-test.yaml`):
+
+```yaml
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: integration-test
+spec:
+  steps:
+    - name: test
+      image: golang:1.24
+      script: |
+        # Docker-in-Docker or use a sidecar
+        make test-integration
+      volumeMounts:
+        - name: docker-socket
+          mountPath: /var/run/docker.sock
+```
+
+##### Step 6: Testing the Full HTTP Stack (Optional Advanced)
+
+For testing the complete HTTP middleware chain:
+
+```go
+package api_test
+
+import (
+    "net/http/httptest"
+    "encoding/json"
+)
+
+var _ = Describe("Full HTTP Integration", func() {
+    var httpServer *httptest.Server
+
+    BeforeEach(func() {
+        // Create the full HTTP handler with middleware
+        swagger, _ := generated.GetSwagger()
+        handler := generated.HandlerWithOptions(
+            generated.NewStrictHandler(server, nil),
+            generated.StdHTTPServerOptions{
+                Middlewares: []generated.MiddlewareFunc{
+                    middleware.OpenAPIValidation(swagger),
+                },
+            },
+        )
+        httpServer = httptest.NewServer(handler)
+    })
+
+    AfterEach(func() {
+        httpServer.Close()
+    })
+
+    It("validates request against OpenAPI spec", func() {
+        resp, err := http.Get(httpServer.URL +
+            "/o2ims-infrastructureInventory/v1/resourcePools")
+
+        Expect(err).NotTo(HaveOccurred())
+        Expect(resp.StatusCode).To(Equal(http.StatusOK))
+
+        var pools []generated.ResourcePool
+        json.NewDecoder(resp.Body).Decode(&pools)
+        // Assert...
+    })
+})
+```
+
+#### 16.6 Test Pattern Attribution
+
+Based on git history analysis, here are the team members who introduced each testing pattern:
+
+| Test Pattern | Introduced By | PR/Commit | Date |
+|--------------|---------------|-----------|------|
+| **Ginkgo/Gomega framework** | Juan Hernandez | Initial project setup | Early 2024 |
+| **gomock for repository mocking** | Nahian Pathan | `#498` - "introduce DB and repository layer mocking" | 2024 |
+| **StrictServerInterface testing** | Marcelo Guerrero Viveros | `#540` - "Add unit tests for alarms in cluster server" | 2024 |
+| **pgxmock for SQL mocking** | Nahian Pathan | `#346` - "Use query builder for GetAlarmRecordID endpoint" | 2024 |
+| **Controller tests with envtest** | Multiple contributors | Various PRs | Ongoing |
+| **E2E test framework** | Brent Rowsell | `#887` - "Fix and enable e2e-tests" | 2025 |
+
+##### Key Contributors to Testing Infrastructure
+
+| Contributor | Email | Primary Contributions |
+|-------------|-------|----------------------|
+| **Nahian Pathan** | npathan@redhat.com | Repository mocking, pgxmock patterns, alarms tests |
+| **Marcelo Guerrero Viveros** | marguerr@redhat.com | Server unit tests, StrictServerInterface patterns |
+| **Don Penney** | dpenney@redhat.com | Test infrastructure, Ginkgo setup, linting |
+| **Sharat Akhoury** | - | Controller tests, ClusterInstance handling |
+| **Brent Rowsell** | - | E2E test framework |
+
+#### Summary: Recommendations for Your V11 Work
+
+| Priority | Action | Effort |
+|----------|--------|--------|
+| **1. HIGH** | Add `server_test.go` for resource-server using existing mock patterns | 1-2 days |
+| **2. HIGH** | Add `repository_test.go` with pgxmock for SQL validation | 1 day |
+| **3. MEDIUM** | Implement testcontainers integration tests | 2-3 days |
+| **4. LOW** | Add full HTTP integration tests | 1 day |
+
+The testcontainers approach is **highly recommended** because:
+1. It validates your v11 schema changes against real PostgreSQL
+2. It catches SQL syntax errors that mocks miss
+3. It tests migrations in isolation
+4. It's the industry standard for database integration testing
+
+---
+
+## 17. E2E Test Framework Deep Dive (Brent Rowsell)
+
+*Added January 26, 2026*
+
+### Question
+
+> Talk about the E2E test framework (Brent) you have just been investigating.
+
+### Answer
+
+#### 17.1 E2E Test Framework Overview
+
+The E2E test framework was **introduced by Brent Rowsell** in PR `#887` ("Fix and enable e2e-tests") and has been significantly enhanced by multiple contributors including **Irina Mihai**, **Sharat Akhoury**, **Don Penney**, and **Tao Liu**.
+
+##### Architecture
+
+The E2E tests are located in `test/e2e/e2e_suite_test.go` (~1400 lines) and use **controller-runtime's envtest** to create a **fake Kubernetes API server** with real CRDs.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              E2E TEST ARCHITECTURE                                           │
+├─────────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                              envtest (Fake K8s API Server)                            │   │
+│  │  • Real CRDs installed from config/crd/bases/                                        │   │
+│  │  • Real external CRDs (ACM, SiteConfig, Metal3) from test/utils/vars.go             │   │
+│  │  • No actual cluster required                                                        │   │
+│  └──────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                          │                                                   │
+│                                          ▼                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                          Controller Manager (in-process)                              │   │
+│  │  • ProvisioningRequestReconciler running in test                                     │   │
+│  │  • Watches real CRs created by tests                                                 │   │
+│  └──────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                          │                                                   │
+│                                          ▼                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │                        MockHardwarePluginServer (httptest.Server)                     │   │
+│  │  • Simulates hardware plugin REST API                                                │   │
+│  │  • Creates real K8s NodeAllocationRequest CRs                                        │   │
+│  │  • Returns AllocatedNode details                                                     │   │
+│  └──────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                              │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### Key Components
+
+| Component | Purpose |
+|-----------|---------|
+| `envtest.Environment` | Fake Kubernetes API server with real CRDs |
+| `ProvReqTestReconciler` | Real ProvisioningRequest reconciler running in-process |
+| `MockHardwarePluginServer` | Simulates hardware plugin REST API |
+| `testutils.CreateNodeResources()` | Helper to create test AllocatedNode CRs |
+| `testutils.VerifyStatusCondition()` | Helper to assert CR status conditions |
+
+##### How to Run E2E Tests
+
+```bash
+# Run E2E tests
+make test-e2e
+
+# Or directly with ginkgo
+cd test/e2e && ginkgo -v ./...
+```
+
+---
+
+### Question
+
+> What kind of changes did Brent introduce firstly?
+
+### Answer
+
+#### 17.2 Brent's Initial Contributions
+
+Brent made **two major contributions** that established the testing infrastructure:
+
+##### PR #777: "Update unit tests due to restructuring" (July 28, 2025)
+
+**Massive test infrastructure overhaul** - Added **14,288 lines** across **27 files**:
+
+| Category | Files Added/Modified |
+|----------|---------------------|
+| **Mock Hardware Plugin Server** | `internal/controllers/mock_hardware_plugin_server.go` (535 lines - **NEW**) |
+| **Metal3 Plugin Tests** | 10 new `*_test.go` files in `hwmgr-plugins/metal3/` |
+| **Controller Tests** | Major enhancements to `provisioningrequest_*_test.go` |
+| **Suite Setup** | Restructured `internal/controllers/suite_test.go` |
+
+##### PR #887: "Fix and enable e2e-tests" (August 18, 2025)
+
+**Enhanced the mock server for E2E tests** with Kubernetes integration:
+
+| File Changed | Lines Changed | Purpose |
+|--------------|---------------|---------|
+| `mock_hardware_plugin_server.go` | +137 | Added K8s client integration |
+| `e2e_suite_test.go` | +135 | Fixed and enabled E2E tests |
+| `provisioningrequest_controller.go` | +17 | Added callback config |
+| `suite_test.go` | +95/-95 | Restructured test setup |
+
+#### 17.3 Mock Hardware Plugin Server
+
+##### First Version (PR #777) - Core Mock Server
+
+The initial mock server used Go's `httptest.Server` to simulate the Hardware Plugin REST API:
+
+```go
+// mock_hardware_plugin_server.go - First version
+type MockHardwarePluginServer struct {
+    server                 *httptest.Server
+    nodeAllocationRequests map[string]*hwmgrpluginapi.NodeAllocationRequestResponse
+    allocatedNodes         map[string][]hwmgrpluginapi.AllocatedNode
+}
+```
+
+This mock server:
+- Uses Go's `httptest.Server` to simulate the Hardware Plugin REST API
+- Stores NodeAllocationRequests and AllocatedNodes in memory
+- Provides endpoints: `GET/POST /nodeAllocationRequests`, `GET /allocatedNodes`
+- Allows tests to run **without a real hardware plugin**
+
+##### Enhanced Version (PR #887) - K8s Integration
+
+Added Kubernetes client integration for E2E tests:
+
+```go
+// New constructor with K8s client
+func NewMockHardwarePluginServerWithClient(k8sClient client.Client) *MockHardwarePluginServer {
+    mock := &MockHardwarePluginServer{
+        nodeAllocationRequests: make(map[string]*hwmgrpluginapi.NodeAllocationRequestResponse),
+        allocatedNodes:         make(map[string][]hwmgrpluginapi.AllocatedNode),
+        k8sClient:              k8sClient,  // NEW: Kubernetes client
+    }
+    // ...
+}
+```
+
+##### Key Enhancement: Mock Server Creates Real K8s Resources
+
+When the mock server receives a `POST /nodeAllocationRequests`, it now creates a real Kubernetes CR:
+
+```go
+// When mock server receives POST /nodeAllocationRequests, it creates a real K8s CR
+func (m *MockHardwarePluginServer) createKubernetesNodeAllocationRequest(ctx, request, requestID) error {
+    k8sNodeAllocationRequest := &pluginsv1alpha1.NodeAllocationRequest{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      requestID,
+            Namespace: ctlrutils.UnitTestHwmgrNamespace,
+        },
+        // ... convert API request to K8s CR
+    }
+    return m.k8sClient.Create(ctx, k8sNodeAllocationRequest)
+}
+```
+
+##### E2E Test Suite Setup (PR #887)
+
+```go
+// From test/e2e/e2e_suite_test.go - BeforeSuite
+var _ = BeforeSuite(func() {
+    // Setup envtest with real CRDs
+    testEnv = &envtest.Environment{
+        CRDDirectoryPaths: []string{
+            filepath.Join("..", "..", "config", "crd", "bases"),
+        },
+    }
+
+    // Setup the ProvisioningRequest Reconciler
+    ProvReqTestReconciler = &provisioningcontrollers.ProvisioningRequestReconciler{
+        Client:         K8SClient,
+        Logger:         logger,
+        CallbackConfig: ctlrutils.NewNarCallbackConfig(constants.DefaultNarCallbackServicePort),
+    }
+
+    // Start mock hardware plugin server for e2e tests with Kubernetes client
+    mockServer := provisioningcontrollers.NewMockHardwarePluginServerWithClient(K8SClient)
+
+    // Create HardwarePlugin CR pointing to mock server
+    &hwmgmtv1alpha1.HardwarePlugin{
+        ObjectMeta: metav1.ObjectMeta{Name: testHardwarePluginRef},
+        Spec: hwmgmtv1alpha1.HardwarePluginSpec{
+            ApiRoot: mockServer.GetURL(),  // Points to mock!
+            AuthClientConfig: &common.AuthClientConfig{
+                Type:            common.Basic,
+                BasicAuthSecret: stringPtr("test-hwmgr-auth-secret"),
+            },
+        },
+    }
+})
+```
+
+#### 17.4 E2E Test Architecture Summary
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    E2E Test Architecture (Brent)                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────┐     ┌───────────────────────────────┐│
+│  │   Ginkgo Test Suite  │     │   envtest (Fake K8s API)     ││
+│  │  (e2e_suite_test.go) │────▶│   - Real CRDs installed      ││
+│  └──────────┬───────────┘     │   - Real reconcilers         ││
+│             │                 └───────────────────────────────┘│
+│             │                                                   │
+│             │ Creates CRs                                       │
+│             ▼                                                   │
+│  ┌──────────────────────┐     ┌───────────────────────────────┐│
+│  │  ProvisioningRequest │────▶│   ProvReqTestReconciler      ││
+│  │  (test CR)           │     │   (calls hardware plugin)    ││
+│  └──────────────────────┘     └───────────┬───────────────────┘│
+│                                           │                     │
+│                                           │ REST calls to       │
+│                                           ▼                     │
+│                               ┌───────────────────────────────┐│
+│                               │  MockHardwarePluginServer    ││
+│                               │  (httptest.Server)            ││
+│                               │  - Simulates REST API         ││
+│                               │  - Creates K8s CRs (v2)       ││
+│                               └───────────────────────────────┘│
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+##### Why Brent's Contributions Matter
+
+| Before Brent | After Brent |
+|--------------|-------------|
+| E2E tests were broken/disabled | E2E tests run automatically |
+| No way to test hardware provisioning flow | Mock server simulates full flow |
+| Tests required real hardware plugin | Tests run with no external dependencies |
+| ~2,800 lines in controller tests | ~14,000+ lines with comprehensive coverage |
+
+##### Key Files from Brent's Contributions
+
+| File | Purpose |
+|------|---------|
+| `internal/controllers/mock_hardware_plugin_server.go` | Mock hardware plugin REST API |
+| `test/e2e/e2e_suite_test.go` | E2E test suite with envtest |
+| `internal/controllers/suite_test.go` | Controller unit test setup |
+| `hwmgr-plugins/metal3/controller/*_test.go` | Metal3 plugin tests |
+
+The mock server is **essential** for testing the provisioning flow without requiring actual hardware infrastructure (Metal3, BMC, etc.).
+
+---
+
 ## Document Information
 
 - **Generated:** January 12, 2026
 - **Reviewed:** January 19, 2026 (corrections based on official docs)
 - **Updated:** January 21, 2026 (added Server Pattern section)
+- **Updated:** January 26, 2026 (added StrictServerInterface and Testing section)
+- **Updated:** January 26, 2026 (added Inventory Testing Assessment and Testcontainers guide)
+- **Updated:** January 26, 2026 (added E2E Test Framework Deep Dive - Brent Rowsell)
 - **Project:** O-RAN O2IMS Operator
 - **Repository:** `github.com/openshift-kni/oran-o2ims`
