@@ -601,8 +601,8 @@ go-generate:
 
 .PHONY: test tests
 test tests:
-	@echo "Run ginkgo"
-	ginkgo run -r ./internal ./api ./hwmgr-plugins $(ginkgo_flags)
+	@echo "Run ginkgo (excluding integration tests)"
+	ginkgo run -r --label-filter="!integration" ./internal ./api ./hwmgr-plugins $(ginkgo_flags)
 
 .PHONY: test-e2e
 test-e2e: envtest kubectl
@@ -615,6 +615,41 @@ endif
 test-crd-watcher:
 	@echo "Run crd-watcher unit tests"
 	cd dev-tools/crd-watcher && go test -v $(ginkgo_flags)
+
+.PHONY: check-podman
+check-podman: ## Verify Podman is available and can run containers
+	@echo "Checking Podman status ..."
+	@command -v podman >/dev/null 2>&1 || { echo "Error: Podman is not installed"; exit 1; }
+	@echo "Podman available: $$(podman --version)"
+	@SOCKET_PATH=$$(podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null); \
+	if [ -z "$$SOCKET_PATH" ] || [ ! -S "$$SOCKET_PATH" ]; then \
+		echo "Error: Podman socket not available."; \
+		echo "  Start it with: systemctl --user enable --now podman.socket"; \
+		exit 1; \
+	fi; \
+	echo "Podman socket: $$SOCKET_PATH"
+	@echo "Testing container execution with Podman..."
+	@podman run --rm docker.io/library/alpine:latest true 2>/dev/null || { \
+		echo "Error: Podman cannot execute containers"; exit 1; }
+	@echo "Podman can execute containers"
+	@echo "Podman is ready!"
+
+.PHONY: test-resource-migrations
+test-resource-migrations: check-podman ## Run resources service migration tests (requires Podman)
+	@echo "Running resources DB migrations integration tests with Podman..."
+	DOCKER_HOST=$$(podman info --format 'unix://{{.Host.RemoteSocket.Path}}') \
+	TESTCONTAINERS_RYUK_DISABLED=true \
+	ginkgo run --label-filter="integration" ./internal/service/resources/db $(ginkgo_flags)
+
+.PHONY: test-resource-server
+test-resource-server: check-podman ## Run resource server API integration tests (requires Podman)
+	@echo "Running resources REST API integration tests with Podman..."
+	DOCKER_HOST=$$(podman info --format 'unix://{{.Host.RemoteSocket.Path}}') \
+	TESTCONTAINERS_RYUK_DISABLED=true \
+	ginkgo run --label-filter="integration" ./internal/service/resources/api $(ginkgo_flags)
+
+.PHONY: test-integration
+test-integration: test-resource-migrations test-resource-server ## Run all integration tests
 
 .PHONY: fmt
 fmt:
