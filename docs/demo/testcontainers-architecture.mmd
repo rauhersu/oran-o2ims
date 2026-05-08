@@ -1,0 +1,26 @@
+flowchart LR
+    Test["<b>Test Code</b>"]
+
+    subgraph TestInfra ["<b>Test Infrastructure</b>"]
+        ET["K8s API server (envtest)"]
+        TC["PostgreSQL (testcontainers)"]
+    end
+
+    subgraph CodeUnderTest ["<b>Code under test</b>"]
+        C["Controllers: Location, OCloudSite, ResourcePool"]
+        COL["Collector: watch events and writes to DB"]
+        API["REST API Server: reads from DB"]
+    end
+
+    Test -->|"1. Create CRs"| ET
+    ET -->|"2. Reconcile"| C
+    C -->|"3. Set Ready"| ET
+    ET -->|"4. Watch event"| COL
+    COL -->|"5. Persist"| TC
+    Test <-->|"6. HTTP GET"| API
+    API <-->|"7. Query"| TC
+
+    style TestInfra fill:#bbdefb,stroke:#0d47a1,stroke-width:2px
+    style CodeUnderTest fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style Test fill:#eeeeee,stroke:#212121,stroke-width:2px
+    style TC fill:#fff3e0,stroke:#e65100,stroke-width:2px

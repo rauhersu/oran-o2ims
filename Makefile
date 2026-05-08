@@ -642,6 +642,34 @@ test-crd-watcher:
 	@echo "Run crd-watcher unit tests"
 	cd dev-tools/crd-watcher && go test -v $(ginkgo_flags)
 
+.PHONY: check-podman
+check-podman: ## Verify Podman is available and can run containers
+	@echo "Checking Podman status ..."
+	@command -v podman >/dev/null 2>&1 || { echo "Error: Podman is not installed"; exit 1; }
+	@echo "Podman available: $$(podman --version)"
+	@SOCKET_PATH=$$(podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null); \
+	if [ -z "$$SOCKET_PATH" ] || [ ! -S "$$SOCKET_PATH" ]; then \
+		echo "Error: Podman socket not available."; \
+		echo "  Start it with: systemctl --user enable --now podman.socket"; \
+		exit 1; \
+	fi; \
+	echo "Podman socket: $$SOCKET_PATH"
+	@echo "Testing container execution with Podman..."
+	@podman run --rm docker.io/library/alpine:latest true 2>/dev/null || { \
+		echo "Error: Podman cannot execute containers"; exit 1; }
+	@echo "Podman is ready!"
+
+.PHONY: test-testcontainers
+test-testcontainers: check-podman envtest ## Run testcontainers tests (envtest + PostgreSQL + httptest, requires Podman)
+ifeq ($(shell uname -s),Linux)
+	@chmod -R u+w $(LOCALBIN)
+endif
+	@echo "Running testcontainers tests (envtest + PostgreSQL + HTTP API)..."
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -i --bin-dir $(LOCALBIN) -p path)" \
+	DOCKER_HOST=$$(podman info --format 'unix://{{.Host.RemoteSocket.Path}}') \
+	TESTCONTAINERS_RYUK_DISABLED=true \
+	ginkgo run --label-filter="testcontainers" ./internal/service/resources/e2e_envtest $(ginkgo_flags)
+
 .PHONY: test-coverage-check
 test-coverage-check: ## Check code coverage against per-package thresholds
 	@echo "Merging coverage profiles"

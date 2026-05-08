@@ -1,0 +1,9 @@
+{
+  "flowchart": {
+    "defaultRenderer": "elk",
+    "elk": {
+      "edgeRouting": "ORTHOGONAL",
+      "nodePlacement.strategy": "NETWORK_SIMPLEX"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+---
+config:
+  layout: elk
+  elk:
+    mergeEdges: false
+    nodePlacementStrategy: NETWORK_SIMPLEX
+---
+flowchart LR
+    A["Code under test"] -- "readFromDB()" --> B["PostgreSQL mock"]
+    B -. "fake/hardcoded response" .-> A
+
+    style A fill:#f5f5f5,stroke:#151515,stroke-width:2px
+    style B fill:#fff3e0,stroke:#e65100,stroke-width:2px

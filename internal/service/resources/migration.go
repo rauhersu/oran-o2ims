@@ -17,11 +17,14 @@ import (
 )
 
 //go:embed db/migrations/*.sql
-var migrations embed.FS
+var MigrationsFS embed.FS
+
+// MigrationsDir is the subdirectory within MigrationsFS containing the SQL files.
+const MigrationsDir = "db/migrations"
 
 // StartResourcesMigration initiates the migration process for the resource server database
 func StartResourcesMigration() error {
-	driver, err := iofs.New(migrations, "db/migrations")
+	driver, err := iofs.New(MigrationsFS, MigrationsDir)
 	if err != nil {
 		return fmt.Errorf("failed to create migrations source: %w", err)
 	}
