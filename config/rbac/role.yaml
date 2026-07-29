@@ -283,15 +283,6 @@ rules:
   - update
   - watch
 - apiGroups:
-  - monitoring.coreos.com
-  resources:
-  - prometheusrules
-  - servicemonitors
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
   - networking.k8s.io
   resources:
   - ingresses

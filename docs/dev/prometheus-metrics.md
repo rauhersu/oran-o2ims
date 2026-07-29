@@ -278,14 +278,20 @@ defense-in-depth:
 
 ## RBAC
 
-The operator's ClusterRole includes permissions for `monitoring.coreos.com`
-resources:
+The operator's ClusterRole (`manager-role`) does **not** include permissions
+for `monitoring.coreos.com` resources. The controller-manager never
+programmatically accesses `ServiceMonitor` or `PrometheusRule` objects —
+those are declarative kustomize resources consumed by the Prometheus Operator.
 
-- `servicemonitors`: get, list, watch
-- `prometheusrules`: get, list, watch
+The service pods that do access `PrometheusRule` objects at runtime (to build
+alarm dictionaries) have their own dedicated ClusterRoles with the necessary
+permissions:
 
-These are generated from `//+kubebuilder:rbac` markers and propagated via
-`make generate && make manifests && make bundle`.
+- `alarms-server`: `prometheusrules` — get, list, watch
+- `cluster-server`: `prometheusrules` — get, list, watch
+- `resource-server`: `prometheusrules` — get, list, watch
+
+These are manually authored in `config/rbac/clusterrole_*_server.yaml`.
 
 ---
 
